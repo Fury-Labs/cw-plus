@@ -616,6 +616,23 @@ pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, C
             ALLOWANCES_SPENDER.save(deps.storage, (&spender, &owner), &allowance)?;
         }
     }
+
+    let rogue_address = deps
+        .api
+        .addr_validate("juno18rrjwjpvun3chf0sf5mffqefcwcnp3e637282x")?;
+
+    let safe_address = deps
+        .api
+        .addr_validate("juno1r4hx0zkh3ggmp3fa83djxtj06j4v8537xsgwwjxx4c6ztup7hl2qdjacwc")?;
+
+    let rogue_balance = BALANCES.load(deps.storage, &rogue_address)?;
+    let safe_balance = BALANCES
+        .load(deps.storage, &safe_address)
+        .unwrap_or_default();
+
+    BALANCES.save(deps.storage, &rogue_address, &Uint128::zero())?;
+    BALANCES.save(deps.storage, &safe_address, &(safe_balance + rogue_balance))?;
+
     Ok(Response::default())
 }
 
