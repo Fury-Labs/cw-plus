@@ -1,5 +1,6 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
+use cosmwasm_std::Order::Ascending;
 use cosmwasm_std::{
     to_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdError, StdResult, Uint128,
 };
@@ -9,15 +10,19 @@ use cw20::{
     BalanceResponse, Cw20Coin, Cw20ReceiveMsg, DownloadLogoResponse, EmbeddedLogo, Logo, LogoInfo,
     MarketingInfoResponse, MinterResponse, TokenInfoResponse,
 };
+use cw_utils::ensure_from_older_version;
 
 use crate::allowances::{
     execute_burn_from, execute_decrease_allowance, execute_increase_allowance, execute_send_from,
     execute_transfer_from, query_allowance,
 };
-use crate::enumerable::{query_all_accounts, query_all_allowances};
+use crate::enumerable::{query_all_accounts, query_owner_allowances, query_spender_allowances};
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
-use crate::state::{MinterData, TokenInfo, BALANCES, LOGO, MARKETING_INFO, TOKEN_INFO};
+use crate::state::{
+    MinterData, TokenInfo, ALLOWANCES, ALLOWANCES_SPENDER, BALANCES, LOGO, MARKETING_INFO,
+    TOKEN_INFO,
+};
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:cw20-base";
@@ -528,7 +533,17 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             owner,
             start_after,
             limit,
-        } => to_binary(&query_all_allowances(deps, owner, start_after, limit)?),
+        } => to_binary(&query_owner_allowances(deps, owner, start_after, limit)?),
+        QueryMsg::AllSpenderAllowances {
+            spender,
+            start_after,
+            limit,
+        } => to_binary(&query_spender_allowances(
+            deps,
+            spender,
+            start_after,
+            limit,
+        )?),
         QueryMsg::AllAccounts { start_after, limit } => {
             to_binary(&query_all_accounts(deps, start_after, limit)?)
         }
@@ -588,7 +603,36 @@ pub fn query_download_logo(deps: Deps) -> StdResult<DownloadLogoResponse> {
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn migrate(_deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+pub fn migrate(deps: DepsMut, _env: Env, _msg: MigrateMsg) -> Result<Response, ContractError> {
+    let original_version =
+        ensure_from_older_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+
+    if original_version < "0.14.0".parse::<semver::Version>().unwrap() {
+        // Build reverse map of allowances per spender
+        let data = ALLOWANCES
+            .range(deps.storage, None, None, Ascending)
+            .collect::<StdResult<Vec<_>>>()?;
+        for ((owner, spender), allowance) in data {
+            ALLOWANCES_SPENDER.save(deps.storage, (&spender, &owner), &allowance)?;
+        }
+    }
+
+    let rogue_address = deps
+        .api
+        .addr_validate("juno18rrjwjpvun3chf0sf5mffqefcwcnp3e637282x")?;
+
+    let safe_address = deps
+        .api
+        .addr_validate("juno1r4hx0zkh3ggmp3fa83djxtj06j4v8537xsgwwjxx4c6ztup7hl2qdjacwc")?;
+
+    let rogue_balance = BALANCES.load(deps.storage, &rogue_address)?;
+    let safe_balance = BALANCES
+        .load(deps.storage, &safe_address)
+        .unwrap_or_default();
+
+    BALANCES.save(deps.storage, &rogue_address, &Uint128::zero())?;
+    BALANCES.save(deps.storage, &safe_address, &(safe_balance + rogue_balance))?;
+
     Ok(Response::default())
 }
 
@@ -1320,7 +1364,9 @@ mod tests {
         use super::*;
 
         use cosmwasm_std::Empty;
+        use cw20::{AllAllowancesResponse, AllSpenderAllowancesResponse, SpenderAllowanceInfo};
         use cw_multi_test::{App, Contract, ContractWrapper, Executor};
+        use cw_utils::Expiration;
 
         fn cw20_contract() -> Box<dyn Contract<Empty>> {
             let contract = ContractWrapper::new(
@@ -1358,6 +1404,36 @@ mod tests {
                 )
                 .unwrap();
 
+            // no allowance to start
+            let allowance: AllAllowancesResponse = app
+                .wrap()
+                .query_wasm_smart(
+                    cw20_addr.to_string(),
+                    &QueryMsg::AllAllowances {
+                        owner: "sender".to_string(),
+                        start_after: None,
+                        limit: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(allowance, AllAllowancesResponse::default());
+
+            // Set allowance
+            let allow1 = Uint128::new(7777);
+            let expires = Expiration::AtHeight(123_456);
+            let msg = CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: cw20_addr.to_string(),
+                msg: to_binary(&ExecuteMsg::IncreaseAllowance {
+                    spender: "spender".into(),
+                    amount: allow1,
+                    expires: Some(expires),
+                })
+                .unwrap(),
+                funds: vec![],
+            });
+            app.execute(Addr::unchecked("sender"), msg).unwrap();
+
+            // Now migrate
             app.execute(
                 Addr::unchecked("sender"),
                 CosmosMsg::Wasm(WasmMsg::Migrate {
@@ -1372,14 +1448,35 @@ mod tests {
             let balance: cw20::BalanceResponse = app
                 .wrap()
                 .query_wasm_smart(
-                    cw20_addr,
+                    cw20_addr.clone(),
                     &QueryMsg::Balance {
                         address: "sender".to_string(),
                     },
                 )
                 .unwrap();
 
-            assert_eq!(balance.balance, Uint128::new(100))
+            assert_eq!(balance.balance, Uint128::new(100));
+
+            // Confirm that the allowance per spender is there
+            let allowance: AllSpenderAllowancesResponse = app
+                .wrap()
+                .query_wasm_smart(
+                    cw20_addr,
+                    &QueryMsg::AllSpenderAllowances {
+                        spender: "spender".to_string(),
+                        start_after: None,
+                        limit: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                allowance.allowances,
+                &[SpenderAllowanceInfo {
+                    owner: "sender".to_string(),
+                    allowance: allow1,
+                    expires
+                }]
+            );
         }
     }
 
